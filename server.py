@@ -16,6 +16,8 @@ def pending_key(data):
         return msg_id
     if data.get("type") == "audio_request":
         return f"audio_request:{msg_id}"
+    if data.get("type") in ("friend_removed", "account_deleted"):
+        return f"status:{msg_id}"
     return None
 
 
@@ -54,11 +56,16 @@ async def handler(websocket):
                 # Reenvío de mensajes (chat, ping, pong, add_friend, etc.) al destinatario
                 else:
                     recipient = data.get("recipient")
-                    if msg_type in ("chat_ack", "audio_request_ack"):
+                    if msg_type in ("chat_ack", "audio_request_ack", "status_ack"):
                         msg_id = data.get("msg_id")
                         original_recipient = data.get("sender")
                         if msg_id and original_recipient in pending_messages:
-                            key = msg_id if msg_type == "chat_ack" else f"audio_request:{msg_id}"
+                            if msg_type == "chat_ack":
+                                key = msg_id
+                            elif msg_type == "audio_request_ack":
+                                key = f"audio_request:{msg_id}"
+                            else:
+                                key = f"status:{msg_id}"
                             pending_messages[original_recipient].pop(key, None)
                             if not pending_messages[original_recipient]:
                                 del pending_messages[original_recipient]

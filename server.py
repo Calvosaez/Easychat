@@ -1,18 +1,22 @@
 import asyncio
 import json
 import os
+from http import HTTPStatus
 import websockets
 
-# Guardará la conexión activa de cada usuario: { "nombre_usuario": set(websockets) }
+# Guardará la conexión activa de cada usuario: { "nombre_usuario": websocket }
 connected_clients = {}
 pending_messages = {}
 
 
 def pending_key(data):
+    msg_type = data.get("type")
+    if msg_type == "add_friend":
+        sender = data.get("sender")
+        return f"add_friend:{sender}" if sender else None
     msg_id = data.get("msg_id")
     if not msg_id:
         return None
-    msg_type = data.get("type")
     if msg_type == "chat_msg":
         return msg_id
     if msg_type == "audio_request":
@@ -50,24 +54,21 @@ async def handler(websocket):
                     username = data.get("username")
                     if username:
                         current_user = username
-                        if username not in connected_clients:
-                            connected_clients[username] = set()
-                        
-                        # Request sync from other active connections of the same user
-                        if len(connected_clients[username]) > 0:
-                            for ws in list(connected_clients[username]):
-                                try:
-                                    await ws.send(json.dumps({"type": "sync_request"}))
-                                except websockets.exceptions.ConnectionClosed:
-                                    pass
-
-                        connected_clients[username].add(websocket)
-                        print(f"[+] Usuario en línea: {username} (Conexiones: {len(connected_clients[username])})")
+                        connected_clients[username] = websocket
+                        print(f"[+] Usuario en línea: {username}")
                         await websocket.send(json.dumps({"type": "registered", "status": "ok"}))
                         await deliver_pending(username, websocket)
 
                 elif msg_type == "connection_ping":
                     await websocket.send(json.dumps({"type": "connection_pong"}))
+
+                elif msg_type == "friend_ack":
+                    original_recipient = data.get("sender")
+                    original_sender = data.get("recipient")
+                    if original_recipient in pending_messages:
+                        pending_messages[original_recipient].pop(f"add_friend:{original_sender}", None)
+                        if not pending_messages[original_recipient]:
+                            del pending_messages[original_recipient]
 
                 # Reenvío de mensajes (chat, ping, pong, add_friend, etc.) al destinatario
                 else:
@@ -93,19 +94,13 @@ async def handler(websocket):
                             if not pending_messages[original_recipient]:
                                 del pending_messages[original_recipient]
 
-                    if recipient and recipient in connected_clients and len(connected_clients[recipient]) > 0:
-                        disconnected = set()
-                        for target_ws in list(connected_clients[recipient]):
-                            try:
-                                await target_ws.send(json.dumps(data))
-                            except websockets.exceptions.ConnectionClosed:
-                                disconnected.add(target_ws)
-                        
-                        for dead_ws in disconnected:
-                            connected_clients[recipient].discard(dead_ws)
-                        
-                        if not connected_clients[recipient]:
-                            del connected_clients[recipient]
+                    if recipient and recipient in connected_clients:
+                        target_ws = connected_clients[recipient]
+                        try:
+                            await target_ws.send(json.dumps(data))
+                        except websockets.exceptions.ConnectionClosed:
+                            if connected_clients.get(recipient) is target_ws:
+                                del connected_clients[recipient]
                             queue_pending(recipient, data)
                     else:
                         queue_pending(recipient, data)
@@ -117,16 +112,32 @@ async def handler(websocket):
         pass
     finally:
         # Al desconectarse, lo quitamos de la lista de usuarios activos
-        if current_user and current_user in connected_clients:
-            connected_clients[current_user].discard(websocket)
-            if not connected_clients[current_user]:
-                del connected_clients[current_user]
-            print(f"[-] Conexión cerrada para: {current_user}")
+        if current_user and connected_clients.get(current_user) is websocket:
+            del connected_clients[current_user]
+            print(f"[-] Usuario desconectado: {current_user}")
+
+
+def process_request(path, _request_headers):
+    """Sirve los dos archivos de actualización desde el mismo servicio Render."""
+    filename = {
+        "/Easychat_version.txt": "Easychat_version.txt",
+        "/Easychat.apk": "Easychat.apk",
+    }.get(path)
+    if not filename:
+        return None
+    server_dir = os.path.dirname(__file__)
+    candidates = (os.path.join(server_dir, filename), os.path.join(os.path.dirname(server_dir), filename))
+    file_path = next((candidate for candidate in candidates if os.path.isfile(candidate)), None)
+    if not file_path:
+        return HTTPStatus.NOT_FOUND, [("Content-Type", "text/plain")], b"Not found"
+    content_type = "text/plain; charset=utf-8" if filename.endswith(".txt") else "application/vnd.android.package-archive"
+    with open(file_path, "rb") as file:
+        return HTTPStatus.OK, [("Content-Type", content_type), ("Cache-Control", "no-store")], file.read()
 
 async def main():
     # Render asigna automáticamente el puerto a través de la variable PORT
     port = int(os.environ.get("PORT", 8080))
-    async with websockets.serve(handler, "0.0.0.0", port):
+    async with websockets.serve(handler, "0.0.0.0", port, process_request=process_request):
         print(f"Servidor corriendo en el puerto {port}")
         await asyncio.Future()
 

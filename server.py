@@ -3,7 +3,7 @@ import json
 import os
 import websockets
 
-# Guardará la conexión activa de cada usuario: { "nombre_usuario": websocket }
+# Guardará la conexión activa de cada usuario: { "nombre_usuario": set(websockets) }
 connected_clients = {}
 pending_messages = {}
 
@@ -21,7 +21,7 @@ def pending_key(data):
         return f"read_receipt:{msg_id}"
     if msg_type in ("friend_removed", "account_deleted"):
         return f"status:{msg_id}"
-    if msg_type in ("group_chat_msg", "group_update", "group_deleted"):
+    if msg_type in ("group_chat_msg", "group_update", "group_deleted", "group_read_receipt"):
         return f"{msg_type}:{data.get('group_id', '')}:{msg_id}"
     return None
 
@@ -50,8 +50,19 @@ async def handler(websocket):
                     username = data.get("username")
                     if username:
                         current_user = username
-                        connected_clients[username] = websocket
-                        print(f"[+] Usuario en línea: {username}")
+                        if username not in connected_clients:
+                            connected_clients[username] = set()
+                        
+                        # Request sync from other active connections of the same user
+                        if len(connected_clients[username]) > 0:
+                            for ws in list(connected_clients[username]):
+                                try:
+                                    await ws.send(json.dumps({"type": "sync_request"}))
+                                except websockets.exceptions.ConnectionClosed:
+                                    pass
+
+                        connected_clients[username].add(websocket)
+                        print(f"[+] Usuario en línea: {username} (Conexiones: {len(connected_clients[username])})")
                         await websocket.send(json.dumps({"type": "registered", "status": "ok"}))
                         await deliver_pending(username, websocket)
 
@@ -82,13 +93,19 @@ async def handler(websocket):
                             if not pending_messages[original_recipient]:
                                 del pending_messages[original_recipient]
 
-                    if recipient and recipient in connected_clients:
-                        target_ws = connected_clients[recipient]
-                        try:
-                            await target_ws.send(json.dumps(data))
-                        except websockets.exceptions.ConnectionClosed:
-                            if connected_clients.get(recipient) is target_ws:
-                                del connected_clients[recipient]
+                    if recipient and recipient in connected_clients and len(connected_clients[recipient]) > 0:
+                        disconnected = set()
+                        for target_ws in list(connected_clients[recipient]):
+                            try:
+                                await target_ws.send(json.dumps(data))
+                            except websockets.exceptions.ConnectionClosed:
+                                disconnected.add(target_ws)
+                        
+                        for dead_ws in disconnected:
+                            connected_clients[recipient].discard(dead_ws)
+                        
+                        if not connected_clients[recipient]:
+                            del connected_clients[recipient]
                             queue_pending(recipient, data)
                     else:
                         queue_pending(recipient, data)
@@ -100,9 +117,11 @@ async def handler(websocket):
         pass
     finally:
         # Al desconectarse, lo quitamos de la lista de usuarios activos
-        if current_user and connected_clients.get(current_user) is websocket:
-            del connected_clients[current_user]
-            print(f"[-] Usuario desconectado: {current_user}")
+        if current_user and current_user in connected_clients:
+            connected_clients[current_user].discard(websocket)
+            if not connected_clients[current_user]:
+                del connected_clients[current_user]
+            print(f"[-] Conexión cerrada para: {current_user}")
 
 async def main():
     # Render asigna automáticamente el puerto a través de la variable PORT

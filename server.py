@@ -2,26 +2,18 @@ import asyncio
 import json
 import os
 import sqlite3
+import urllib.error
+import urllib.request
 from http import HTTPStatus
 
 import websockets
-
-try:
-    import psycopg
-except ImportError:
-    psycopg = None
 
 
 connected_clients = {}
 
 ACK_TYPES = {
-    "chat_ack",
-    "audio_request_ack",
-    "audio_reply_ack",
-    "read_receipt_ack",
-    "status_ack",
-    "group_ack",
-    "friend_ack",
+    "chat_ack", "audio_request_ack", "audio_reply_ack", "read_receipt_ack",
+    "status_ack", "group_ack", "friend_ack",
 }
 
 
@@ -30,7 +22,6 @@ def pending_key(data):
     sender = str(data.get("sender") or "")
     msg_id = str(data.get("msg_id") or "")
     group_id = str(data.get("group_id") or "")
-
     if msg_type == "add_friend":
         return f"add_friend:{sender}" if sender else None
     if msg_type == "friend_ack":
@@ -68,42 +59,47 @@ def pending_key(data):
 
 
 class PendingStore:
-    """Persistent inbox backed by Postgres on Render, with a local fallback."""
+    """Persistent inbox via the PHP API hosted alongside x10hosting MySQL."""
 
     def __init__(self):
-        self.database_url = os.environ.get("DATABASE_URL", "").strip()
+        self.api_url = os.environ.get("X10_QUEUE_URL", "").strip()
+        self.api_token = os.environ.get("X10_QUEUE_TOKEN", "").strip()
         self.sqlite_path = os.environ.get("PENDING_DB_PATH", "pending_messages.sqlite3")
-        self.pg = None
         self.sqlite = None
         self.lock = asyncio.Lock()
 
-    async def open(self):
-        if self.database_url:
-            if psycopg is None:
-                raise RuntimeError("DATABASE_URL is configured but psycopg is not installed")
-            self.pg = await psycopg.AsyncConnection.connect(self.database_url, autocommit=True)
-            await self.pg.execute(
-                """
-                CREATE TABLE IF NOT EXISTS easychat_pending_messages (
-                    sequence BIGSERIAL PRIMARY KEY,
-                    recipient TEXT NOT NULL,
-                    message_key TEXT NOT NULL,
-                    payload JSONB NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    UNIQUE (recipient, message_key)
-                )
-                """
-            )
-            await self.pg.execute(
-                "ALTER TABLE easychat_pending_messages ADD COLUMN IF NOT EXISTS sequence BIGSERIAL"
-            )
-            await self.pg.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS easychat_pending_recipient_key "
-                "ON easychat_pending_messages (recipient, message_key)"
-            )
-            print("[store] Cola persistente conectada a PostgreSQL")
-            return
+    @property
+    def remote(self):
+        return bool(self.api_url and self.api_token)
 
+    def _api_request_sync(self, body):
+        request = urllib.request.Request(
+            self.api_url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-EasyChat-Queue-Token": self.api_token,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"No se pudo acceder a la cola de x10hosting: {error}") from error
+        if not isinstance(data, dict) or not data.get("success"):
+            raise RuntimeError(f"La cola de x10hosting devolvio un error: {data}")
+        return data
+
+    async def _api(self, body):
+        return await asyncio.to_thread(self._api_request_sync, body)
+
+    async def open(self):
+        if self.remote:
+            await self._api({"action": "init"})
+            print("[store] Cola persistente conectada a MySQL de x10hosting")
+            return
         self.sqlite = sqlite3.connect(self.sqlite_path, check_same_thread=False)
         self.sqlite.execute(
             """
@@ -118,67 +114,38 @@ class PendingStore:
             """
         )
         self.sqlite.commit()
-        print(
-            "[store] AVISO: usando SQLite local. En Render configura DATABASE_URL "
-            "para conservar mensajes tras suspensiones o reinicios."
-        )
+        print("[store] AVISO: configura X10_QUEUE_URL y X10_QUEUE_TOKEN para persistencia real en Render.")
 
     async def close(self):
-        if self.pg is not None:
-            await self.pg.close()
         if self.sqlite is not None:
             self.sqlite.close()
+            self.sqlite = None
 
     async def put(self, recipient, data):
         key = pending_key(data)
         if not recipient or not key:
             return
-        payload = json.dumps(data, ensure_ascii=False)
         async with self.lock:
-            if self.pg is not None:
-                await self.pg.execute(
-                    """
-                    INSERT INTO easychat_pending_messages (recipient, message_key, payload)
-                    VALUES (%s, %s, %s::jsonb)
-                    ON CONFLICT (recipient, message_key)
-                    DO UPDATE SET payload = EXCLUDED.payload
-                    """,
-                    (recipient, key, payload),
-                )
-            else:
-                self.sqlite.execute(
-                    """
-                    INSERT INTO pending_messages (recipient, message_key, payload)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(recipient, message_key)
-                    DO UPDATE SET payload = excluded.payload
-                    """,
-                    (recipient, key, payload),
-                )
-                self.sqlite.commit()
+            if self.remote:
+                await self._api({"action": "put", "recipient": recipient, "message_key": key, "payload": data})
+                return
+            self.sqlite.execute(
+                """
+                INSERT INTO pending_messages (recipient, message_key, payload)
+                VALUES (?, ?, ?)
+                ON CONFLICT(recipient, message_key) DO UPDATE SET payload = excluded.payload
+                """,
+                (recipient, key, json.dumps(data, ensure_ascii=False)),
+            )
+            self.sqlite.commit()
 
     async def list_for(self, recipient):
         async with self.lock:
-            if self.pg is not None:
-                cursor = await self.pg.execute(
-                    """
-                    SELECT message_key, payload
-                    FROM easychat_pending_messages
-                    WHERE recipient = %s
-                    ORDER BY sequence
-                    """,
-                    (recipient,),
-                )
-                rows = await cursor.fetchall()
-                return [(key, payload if isinstance(payload, dict) else json.loads(payload)) for key, payload in rows]
-
+            if self.remote:
+                result = await self._api({"action": "list", "recipient": recipient})
+                return [(str(row["message_key"]), row["payload"]) for row in result.get("messages", [])]
             rows = self.sqlite.execute(
-                """
-                SELECT message_key, payload
-                FROM pending_messages
-                WHERE recipient = ?
-                ORDER BY sequence
-                """,
+                "SELECT message_key, payload FROM pending_messages WHERE recipient = ? ORDER BY sequence",
                 (recipient,),
             ).fetchall()
             return [(key, json.loads(payload)) for key, payload in rows]
@@ -187,17 +154,14 @@ class PendingStore:
         if not recipient or not key:
             return
         async with self.lock:
-            if self.pg is not None:
-                await self.pg.execute(
-                    "DELETE FROM easychat_pending_messages WHERE recipient = %s AND message_key = %s",
-                    (recipient, key),
-                )
-            else:
-                self.sqlite.execute(
-                    "DELETE FROM pending_messages WHERE recipient = ? AND message_key = ?",
-                    (recipient, key),
-                )
-                self.sqlite.commit()
+            if self.remote:
+                await self._api({"action": "delete", "recipient": recipient, "message_key": key})
+                return
+            self.sqlite.execute(
+                "DELETE FROM pending_messages WHERE recipient = ? AND message_key = ?",
+                (recipient, key),
+            )
+            self.sqlite.commit()
 
 
 pending_store = PendingStore()
@@ -206,7 +170,6 @@ pending_store = PendingStore()
 async def deliver_pending(username, websocket):
     for key, data in await pending_store.list_for(username):
         await websocket.send(json.dumps(data, ensure_ascii=False))
-        # Confirmations are terminal: the client consumes them but does not ACK an ACK.
         if data.get("type") in ACK_TYPES:
             await pending_store.delete(username, key)
 
@@ -216,28 +179,19 @@ async def remove_original_pending(data):
     original_recipient = data.get("sender")
     original_sender = data.get("recipient")
     msg_id = data.get("msg_id")
-
     if msg_type == "friend_ack":
         if original_recipient and original_sender:
             await pending_store.delete(original_recipient, f"add_friend:{original_sender}")
         return
     if not msg_id or not original_recipient:
         return
-
-    if msg_type == "chat_ack":
-        key = str(msg_id)
-    elif msg_type == "audio_request_ack":
-        key = f"audio_request:{msg_id}"
-    elif msg_type == "audio_reply_ack":
-        key = f"audio_reply:{msg_id}"
-    elif msg_type == "read_receipt_ack":
-        key = f"read_receipt:{msg_id}"
-    elif msg_type == "status_ack":
-        key = f"status:{msg_id}"
-    elif msg_type == "group_ack":
-        key = f"{data.get('ack_type', '')}:{data.get('group_id', '')}:{msg_id}"
-    else:
-        return
+    if msg_type == "chat_ack": key = str(msg_id)
+    elif msg_type == "audio_request_ack": key = f"audio_request:{msg_id}"
+    elif msg_type == "audio_reply_ack": key = f"audio_reply:{msg_id}"
+    elif msg_type == "read_receipt_ack": key = f"read_receipt:{msg_id}"
+    elif msg_type == "status_ack": key = f"status:{msg_id}"
+    elif msg_type == "group_ack": key = f"{data.get('ack_type', '')}:{data.get('group_id', '')}:{msg_id}"
+    else: return
     await pending_store.delete(original_recipient, key)
 
 
@@ -245,7 +199,6 @@ async def relay_or_queue(recipient, data):
     if not recipient:
         return
     key = pending_key(data)
-    # Persist first so closing either app immediately after sending cannot lose it.
     if key:
         await pending_store.put(recipient, data)
     target_ws = connected_clients.get(recipient)
@@ -254,7 +207,6 @@ async def relay_or_queue(recipient, data):
             await target_ws.send(json.dumps(data, ensure_ascii=False))
             if data.get("type") in ACK_TYPES and key:
                 await pending_store.delete(recipient, key)
-            return
         except websockets.exceptions.ConnectionClosed:
             if connected_clients.get(recipient) is target_ws:
                 del connected_clients[recipient]
@@ -268,41 +220,30 @@ async def handler(websocket):
                 data = json.loads(message)
             except json.JSONDecodeError:
                 continue
-
             msg_type = data.get("type")
             if msg_type == "register":
                 username = data.get("username")
                 if username:
                     current_user = username
                     connected_clients[username] = websocket
-                    print(f"[+] Usuario en linea: {username}")
                     await websocket.send(json.dumps({"type": "registered", "status": "ok"}))
                     await deliver_pending(username, websocket)
                 continue
-
             if msg_type == "connection_ping":
                 await websocket.send(json.dumps({"type": "connection_pong"}))
                 continue
-
             if msg_type in ACK_TYPES:
                 await remove_original_pending(data)
-
             await relay_or_queue(data.get("recipient"), data)
-
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
         if current_user and connected_clients.get(current_user) is websocket:
             del connected_clients[current_user]
-            print(f"[-] Usuario desconectado: {current_user}")
 
 
 def process_request(path, _request_headers):
-    """Sirve los dos archivos de actualizacion desde el mismo servicio Render."""
-    filename = {
-        "/Easychat_version.txt": "Easychat_version.txt",
-        "/Easychat.apk": "Easychat.apk",
-    }.get(path)
+    filename = {"/Easychat_version.txt": "Easychat_version.txt", "/Easychat.apk": "Easychat.apk"}.get(path)
     if not filename:
         return None
     server_dir = os.path.dirname(__file__)
@@ -317,10 +258,8 @@ def process_request(path, _request_headers):
 
 async def main():
     await pending_store.open()
-    port = int(os.environ.get("PORT", 8080))
     try:
-        async with websockets.serve(handler, "0.0.0.0", port, process_request=process_request):
-            print(f"Servidor corriendo en el puerto {port}")
+        async with websockets.serve(handler, "0.0.0.0", int(os.environ.get("PORT", 8080)), process_request=process_request):
             await asyncio.Future()
     finally:
         await pending_store.close()

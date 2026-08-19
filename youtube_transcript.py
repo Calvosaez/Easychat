@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify, send_from_directory
 import yt_dlp
 import os
+import shutil
+import tempfile
 import urllib.request
 import urllib.error
 import json
@@ -36,6 +38,11 @@ COOKIE_FILE = os.environ.get(
     "/etc/secrets/youtube_cookies.txt"
 ).strip()
 
+RUNTIME_COOKIE_FILE = os.path.join(
+    tempfile.gettempdir(),
+    f"studycards_youtube_cookies_{os.getpid()}.txt"
+)
+
 YOUTUBE_USER_AGENT = os.environ.get(
     "YOUTUBE_USER_AGENT",
     ""
@@ -44,6 +51,20 @@ YOUTUBE_USER_AGENT = os.environ.get(
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/127.0 Safari/537.36"
 )
+
+
+def get_writable_cookie_file():
+
+    if not COOKIE_FILE or not os.path.isfile(COOKIE_FILE):
+        return None
+
+    # Los Secret Files de Render son de solo lectura. yt-dlp actualiza su
+    # cookie jar al terminar, por lo que necesita trabajar sobre una copia.
+    if not os.path.isfile(RUNTIME_COOKIE_FILE):
+        shutil.copyfile(COOKIE_FILE, RUNTIME_COOKIE_FILE)
+        os.chmod(RUNTIME_COOKIE_FILE, 0o600)
+
+    return RUNTIME_COOKIE_FILE
 
 MAX_SUBTITLE_RETRIES = 3
 
@@ -755,11 +776,14 @@ def build_ydl_options():
     }
 
 
-    if COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+    writable_cookie_file = get_writable_cookie_file()
+
+
+    if writable_cookie_file:
 
         options[
             "cookiefile"
-        ] = COOKIE_FILE
+        ] = writable_cookie_file
 
 
     elif COOKIE_BROWSER:

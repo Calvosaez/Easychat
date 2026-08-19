@@ -750,6 +750,12 @@ def build_ydl_options():
         "skip_download":
             True,
 
+        # Solo necesitamos las pistas de subtítulos. YouTube puede ocultar
+        # todos los formatos reproducibles a un servidor aunque sí entregue
+        # los metadatos y captions del vídeo.
+        "ignore_no_formats_error":
+            True,
+
         "extract_flat":
             False,
 

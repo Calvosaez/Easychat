@@ -74,6 +74,39 @@ RETRY_DELAYS = [
     10
 ]
 
+YOUTUBE_CACHE_TTL = 15 * 60
+VIDEO_INFO_CACHE = {}
+TRANSCRIPT_CACHE = {}
+
+
+def get_cached(cache, key):
+
+    cached = cache.get(key)
+    if not cached:
+        return None
+
+    created_at, value = cached
+    if time.time() - created_at >= YOUTUBE_CACHE_TTL:
+        cache.pop(key, None)
+        return None
+
+    return value
+
+
+def set_cached(cache, key, value):
+
+    now = time.time()
+    expired = [
+        cached_key
+        for cached_key, (created_at, _) in cache.items()
+        if now - created_at >= YOUTUBE_CACHE_TTL
+    ]
+    for cached_key in expired:
+        cache.pop(cached_key, None)
+
+    cache[key] = (now, value)
+    return value
+
 
 # ============================================================
 # UTILIDADES
@@ -193,11 +226,7 @@ def download_text(url):
     headers = {
 
         "User-Agent": (
-            "Mozilla/5.0 "
-            "(Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/127.0.0.0 Safari/537.36"
+            YOUTUBE_USER_AGENT
         ),
 
         "Accept": (
@@ -811,6 +840,14 @@ def extract_video_info(
     video_url
 ):
 
+    cached = get_cached(
+        VIDEO_INFO_CACHE,
+        video_url
+    )
+
+    if cached is not None:
+        return cached
+
     options = build_ydl_options()
 
 
@@ -818,10 +855,17 @@ def extract_video_info(
         options
     ) as ydl:
 
-        return ydl.extract_info(
+        info = ydl.extract_info(
             video_url,
             download=False
         )
+
+
+    return set_cached(
+        VIDEO_INFO_CACHE,
+        video_url,
+        info
+    )
 
 
 # ============================================================
@@ -1361,6 +1405,19 @@ def get_transcript_tracks(video_url):
 
 def get_specific_transcript(video_url, source_type, language):
 
+    cache_key = (
+        extract_video_id(video_url) or video_url,
+        source_type,
+        language
+    )
+    cached = get_cached(
+        TRANSCRIPT_CACHE,
+        cache_key
+    )
+
+    if cached is not None:
+        return cached
+
     info = extract_video_info(video_url)
     sources = {
         "manual": info.get("subtitles") or {},
@@ -1384,7 +1441,11 @@ def get_specific_transcript(video_url, source_type, language):
         "source": source_type,
         "message": "Transcripción cargada correctamente."
     })
-    return result
+    return set_cached(
+        TRANSCRIPT_CACHE,
+        cache_key,
+        result
+    )
 
 
 # ============================================================

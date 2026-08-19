@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, send_from_directory
 import yt_dlp
+import os
 import urllib.request
 import urllib.error
 import json
@@ -27,6 +28,22 @@ CORS(
 # ============================================================
 
 COOKIE_BROWSER = None
+
+# En Render las cookies se añaden como Secret File con este nombre. También
+# puede cambiarse la ruta mediante la variable YOUTUBE_COOKIES_FILE.
+COOKIE_FILE = os.environ.get(
+    "YOUTUBE_COOKIES_FILE",
+    "/etc/secrets/youtube_cookies.txt"
+).strip()
+
+YOUTUBE_USER_AGENT = os.environ.get(
+    "YOUTUBE_USER_AGENT",
+    ""
+).strip() or (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/127.0 Safari/537.36"
+)
 
 MAX_SUBTITLE_RETRIES = 3
 
@@ -727,11 +744,7 @@ def build_ydl_options():
         "http_headers": {
 
             "User-Agent": (
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/127.0 Safari/537.36"
+                YOUTUBE_USER_AGENT
             ),
 
             "Accept-Language":
@@ -742,7 +755,14 @@ def build_ydl_options():
     }
 
 
-    if COOKIE_BROWSER:
+    if COOKIE_FILE and os.path.isfile(COOKIE_FILE):
+
+        options[
+            "cookiefile"
+        ] = COOKIE_FILE
+
+
+    elif COOKIE_BROWSER:
 
         options[
             "cookiesfrombrowser"
@@ -1463,6 +1483,24 @@ def transcript():
         text = str(
             error
         )
+
+
+        if "Sign in to confirm" in text:
+
+            return jsonify({
+
+                "error":
+                    "YouTube requiere autenticación para las solicitudes "
+                    "realizadas desde Render.",
+
+                "details":
+                    "Configura el Secret File youtube_cookies.txt "
+                    "en el servicio studycards-transcript.",
+
+                "code":
+                    "YOUTUBE_AUTH_REQUIRED"
+
+            }), 503
 
 
         if (

@@ -1252,6 +1252,91 @@ def get_transcript(
     }
 
 
+def _transcript_metadata(info):
+
+    return {
+        "title": info.get("title", ""),
+        "channel": info.get("channel", info.get("uploader", "")),
+        "videoId": info.get("id", "")
+    }
+
+
+def get_transcript_tracks(video_url):
+
+    info = extract_video_info(video_url)
+    manual_subtitles = info.get("subtitles") or {}
+    automatic_subtitles = info.get("automatic_captions") or {}
+    original_language = (info.get("language") or "").split("-")[0]
+
+    def build_track(language, source):
+        return {
+            "language": language,
+            "source": source,
+            "name": language
+        }
+
+    manual_languages = [
+        language
+        for language, formats in manual_subtitles.items()
+        if formats and language != "live_chat"
+    ]
+    manual_languages.sort(
+        key=lambda language: (
+            language.split("-")[0] != original_language,
+            language.lower()
+        )
+    )
+
+    # Para las pistas automáticas solo ofrecemos los tres idiomas
+    # utilizados por la web. Se excluyen traducciones generadas como ja-en.
+    automatic_languages = [
+        language
+        for language in ("ja", "en", "es")
+        if automatic_subtitles.get(language)
+    ]
+
+    result = _transcript_metadata(info)
+    result.update({
+        "manual": [
+            build_track(language, "manual")
+            for language in manual_languages
+        ],
+        "automatic": [
+            build_track(language, "automatic")
+            for language in automatic_languages
+        ]
+    })
+    return result
+
+
+def get_specific_transcript(video_url, source_type, language):
+
+    info = extract_video_info(video_url)
+    sources = {
+        "manual": info.get("subtitles") or {},
+        "automatic": info.get("automatic_captions") or {}
+    }
+
+    if source_type not in sources:
+        raise ValueError("El origen de subtítulos no es válido.")
+
+    if source_type == "automatic" and language not in ("ja", "en", "es"):
+        raise ValueError("El idioma automático solicitado no está permitido.")
+
+    formats = sources[source_type].get(language) or []
+    if not formats:
+        raise ValueError("La pista de subtítulos solicitada ya no está disponible.")
+
+    result = _transcript_metadata(info)
+    result.update({
+        "items": read_subtitle_track(formats),
+        "language": language,
+        "source": source_type,
+        "message": "Transcripción cargada correctamente."
+    })
+    return result
+
+
 # ============================================================
 # API
 # ============================================================
@@ -1306,9 +1391,29 @@ def transcript():
 
     try:
 
-        result = get_transcript(
-            normalized_url
-        )
+        if request.args.get("list") == "1":
+
+            result = get_transcript_tracks(
+                normalized_url
+            )
+
+        elif (
+            request.args.get("source")
+            and
+            request.args.get("language")
+        ):
+
+            result = get_specific_transcript(
+                normalized_url,
+                request.args.get("source", "").strip(),
+                request.args.get("language", "").strip()
+            )
+
+        else:
+
+            result = get_transcript(
+                normalized_url
+            )
 
 
         return jsonify(
@@ -1344,6 +1449,13 @@ def transcript():
                 str(error)
 
         }), 500
+
+
+    except ValueError as error:
+
+        return jsonify({
+            "error": str(error)
+        }), 400
 
 
     except yt_dlp.utils.DownloadError as error:

@@ -1448,6 +1448,75 @@ def get_specific_transcript(video_url, source_type, language):
     )
 
 
+def _preferred_track_language(tracks, preferred_language):
+
+    preferred_language = (preferred_language or "").strip().lower()
+    if preferred_language not in ("ja", "en", "es"):
+        return None
+
+    available = [
+        language
+        for language, formats in tracks.items()
+        if formats and language != "live_chat"
+    ]
+
+    if preferred_language in available:
+        return preferred_language
+
+    matching = [
+        language
+        for language in available
+        if language.lower().split("-")[0] == preferred_language
+    ]
+    matching.sort(key=lambda language: ("-" in language, language.lower()))
+    return matching[0] if matching else None
+
+
+def get_preferred_transcript(video_url, preferred_language):
+
+    video_id = extract_video_id(video_url) or video_url
+    cache_key = (video_id, "preferred", preferred_language)
+    cached = get_cached(TRANSCRIPT_CACHE, cache_key)
+    if cached is not None:
+        return cached
+
+    info = extract_video_info(video_url)
+    sources = (
+        ("manual", info.get("subtitles") or {}),
+        ("automatic", info.get("automatic_captions") or {})
+    )
+
+    for source_type, tracks in sources:
+        selected_language = _preferred_track_language(
+            tracks,
+            preferred_language
+        )
+        if not selected_language:
+            continue
+
+        items = read_subtitle_track(tracks.get(selected_language) or [])
+        if not items:
+            continue
+
+        result = _transcript_metadata(info)
+        result.update({
+            "items": items,
+            "language": selected_language,
+            "source": source_type,
+            "message": "Transcripción cargada correctamente."
+        })
+        return set_cached(TRANSCRIPT_CACHE, cache_key, result)
+
+    result = _transcript_metadata(info)
+    result.update({
+        "items": [],
+        "language": preferred_language,
+        "source": None,
+        "message": "No hay una transcripción disponible en el idioma solicitado."
+    })
+    return set_cached(TRANSCRIPT_CACHE, cache_key, result)
+
+
 # ============================================================
 # API
 # ============================================================
@@ -1506,6 +1575,20 @@ def transcript():
 
             result = get_transcript_tracks(
                 normalized_url
+            )
+
+        elif request.args.get("preferred_language"):
+
+            preferred_language = request.args.get(
+                "preferred_language",
+                ""
+            ).strip().lower()
+            if preferred_language not in ("ja", "en", "es"):
+                raise ValueError("El idioma preferido no es válido.")
+
+            result = get_preferred_transcript(
+                normalized_url,
+                preferred_language
             )
 
         elif (
